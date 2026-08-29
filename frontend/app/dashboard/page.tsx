@@ -110,7 +110,7 @@ export default function DashboardPage() {
           )}
 
           {/* Balance */}
-          <div className="rounded-2xl bg-gradient-to-br from-brand-600 to-brand-700 text-white p-6 shadow-md">
+          <div className="rounded-2xl bg-gradient-to-br from-green-600 to-brand-700 text-white p-6 shadow-md">
             <div className="flex items-center justify-between">
               <p className="text-brand-100 text-sm">Available balance</p>
               {account?.isAgent && (

@@ -31,7 +31,7 @@ export default function ReportPage() {
     <AppShell>
       <h1 className="text-xl font-bold mb-1">Report a user</h1>
       <p className="text-sm text-slate-500 mb-4">
-        Flagging feeds risk rule <b>R4</b>. Once an account is reported by 3+ separate users, every
+    Once an account is reported by 3+ separate users, every
         transfer to it gets the maximum friction hold — and validators will vote to ban it.
       </p>
 
