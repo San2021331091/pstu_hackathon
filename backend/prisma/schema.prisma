@@ -1,0 +1,264 @@
+// ---------------------------------------------------------------------------
+// Payflow - Friction-First Money Movement - data model
+//
+// Design principles (the "beyond CRUD" part):
+//  1. Money is INTEGER poisha (BigInt), never float. 1 BDT = 100 poisha.
+//  2. DOUBLE-ENTRY LEDGER: LedgerEntry is the append-only source of truth.
+//     Every movement writes balanced entries. Account.balance is a cache.
+//  3. HASH-CHAINED LEDGER (F6): each LedgerEntry stores prevHash + hash
+//     (SHA-256), so the history is tamper-evident (Bitcoin/Ethereum-style).
+//  4. FRICTION LIFECYCLE (F2): a send is scored by the Risk Engine and held
+//     in a cancellable friction window before it finalizes. Funds are
+//     reserved (debited to a HOLD) on initiate so they can't be double-spent.
+//  5. IDEMPOTENCY: Transfer.idempotencyKey UNIQUE -> retries never double-pay.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountType {
+  USER
+  AGENT
+}
+
+model User {
+  id           String      @id @default(uuid())
+  phone        String      @unique
+  name         String
+  passwordHash String
+  accountType  AccountType @default(USER)
+  pinHash      String?                    // for Emergency Freeze unlock (F5)
+  frozen       Boolean     @default(false)
+  createdAt    DateTime    @default(now())
+
+  account Account?
+
+  sentTransfers     Transfer[]     @relation("Sent")
+  receivedTransfers Transfer[]     @relation("Received")
+  requestsMade      MoneyRequest[] @relation("RequestsMade")
+  requestsReceived  MoneyRequest[] @relation("RequestsReceived")
+
+  flagsRaised   Flag[] @relation("FlaggedBy")
+  flagsReceived Flag[] @relation("FlaggedUser")
+
+  groupMemberships GroupMember[]
+  proposalsMade    Proposal[]     @relation("ProposedBy")
+  proposalVotes    ProposalVote[]
+
+  @@index([phone])
+}
+
+model Account {
+  id        String   @id @default(uuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  balance   BigInt   @default(0)         // cached poisha; ledger is source of truth
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ledgerEntries LedgerEntry[]
+
+  @@index([userId])
+}
+
+// A transfer moves money A -> B, but first passes through a friction window.
+enum TransferStatus {
+  PENDING     // in friction window, funds reserved (HOLD), cancellable
+  FINALIZED   // validators passed it, recipient credited
+  CANCELLED   // sender cancelled (or froze) during window, refunded
+  BANNED      // validators voted to ban (2-of-3), refunded
+}
+
+model Transfer {
+  id             String         @id @default(uuid())
+  idempotencyKey String         @unique
+  senderId       String
+  receiverId     String
+  amount         BigInt
+  note           String?
+  status         TransferStatus @default(PENDING)
+
+  // Risk Engine output (F2 / §7)
+  riskScore    Int      @default(0)
+  delaySeconds Int      @default(0)
+  reasons      String[] @default([])   // human-readable rules that fired
+  executeAt    DateTime?               // when the friction window ends
+  finalizedAt  DateTime?
+
+  requestId String? @unique            // set if this settles a money request
+  createdAt DateTime @default(now())
+
+  sender   User @relation("Sent", fields: [senderId], references: [id])
+  receiver User @relation("Received", fields: [receiverId], references: [id])
+
+  entries          LedgerEntry[]
+  validatorBallots ValidatorVote[]
+
+  @@index([senderId, status, createdAt])
+  @@index([receiverId, createdAt])
+  @@index([status, executeAt])
+}
+
+enum EntryType {
+  SIGNUP_BONUS
+  AGENT_CASH_IN
+  TRANSFER_HOLD      // funds reserved out of sender at initiate
+  TRANSFER_IN        // credited to receiver at finalize
+  TRANSFER_REFUND    // hold returned to sender on cancel/ban
+  GROUP_FUND_OUT     // member funds the community wallet
+  GROUP_SPEND_IN     // community wallet pays a recipient
+}
+
+// Append-only, immutable, hash-chained.
+model LedgerEntry {
+  id           String    @id @default(uuid())
+  accountId    String
+  account      Account   @relation(fields: [accountId], references: [id])
+  transferId   String?
+  transfer     Transfer? @relation(fields: [transferId], references: [id])
+  type         EntryType
+  amount       BigInt    // signed poisha: debit negative, credit positive
+  balanceAfter BigInt    // account balance snapshot after this entry
+  memo         String?
+
+  // Hash chain (F6). seq is a global monotonic index for explorer ordering.
+  seq      Int     @unique @default(autoincrement())
+  prevHash String
+  hash     String  @unique
+
+  createdAt DateTime @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([seq])
+}
+
+enum RequestStatus {
+  PENDING
+  PAID
+  DECLINED
+  CANCELLED
+}
+
+model MoneyRequest {
+  id          String        @id @default(uuid())
+  requesterId String
+  payerId     String
+  amount      BigInt
+  note        String?
+  status      RequestStatus @default(PENDING)
+  transferId  String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  requester User @relation("RequestsMade", fields: [requesterId], references: [id])
+  payer     User @relation("RequestsReceived", fields: [payerId], references: [id])
+
+  @@index([payerId, status])
+  @@index([requesterId, status])
+}
+
+// Users can report/flag another account. R4 fires at 3+ distinct reporters,
+// and validators use the same signal to vote-to-ban (F3).
+model Flag {
+  id           String   @id @default(uuid())
+  flaggedId    String
+  flaggedById  String
+  reason       String
+  createdAt    DateTime @default(now())
+
+  flagged   User @relation("FlaggedUser", fields: [flaggedId], references: [id])
+  flaggedBy User @relation("FlaggedBy", fields: [flaggedById], references: [id])
+
+  @@unique([flaggedId, flaggedById])   // one flag per reporter per target
+  @@index([flaggedId])
+}
+
+// Independent validator nodes (F3 / F8). Seeded with 3; 2-of-3 to ban.
+model Validator {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  online    Boolean  @default(true)
+  votesCast Int      @default(0)
+  createdAt DateTime @default(now())
+
+  ballots ValidatorVote[]
+}
+
+model ValidatorVote {
+  id          String    @id @default(uuid())
+  transferId  String
+  validatorId String
+  ban         Boolean               // true = vote to ban this transfer
+  reason      String?
+  createdAt   DateTime  @default(now())
+
+  transfer  Transfer  @relation(fields: [transferId], references: [id])
+  validator Validator @relation(fields: [validatorId], references: [id])
+
+  @@unique([transferId, validatorId])
+}
+
+// Community Wallet / DAO (F4). Group holds its own balance; spends need a
+// majority Yes vote from members (t-of-n, Gnosis-Safe-style).
+model GroupWallet {
+  id        String   @id @default(uuid())
+  name      String
+  balance   BigInt   @default(0)
+  createdAt DateTime @default(now())
+
+  members   GroupMember[]
+  proposals Proposal[]
+}
+
+model GroupMember {
+  id      String @id @default(uuid())
+  groupId String
+  userId  String
+  group   GroupWallet @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user    User        @relation(fields: [userId], references: [id])
+
+  @@unique([groupId, userId])
+  @@index([userId])
+}
+
+enum ProposalStatus {
+  OPEN
+  EXECUTED
+  REJECTED
+}
+
+model Proposal {
+  id          String         @id @default(uuid())
+  groupId     String
+  proposerId  String
+  amount      BigInt
+  recipientId String
+  reason      String
+  status      ProposalStatus @default(OPEN)
+  createdAt   DateTime       @default(now())
+
+  group    GroupWallet    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  proposer User           @relation("ProposedBy", fields: [proposerId], references: [id])
+  votes    ProposalVote[]
+
+  @@index([groupId, status])
+}
+
+model ProposalVote {
+  id         String   @id @default(uuid())
+  proposalId String
+  voterId    String
+  approve    Boolean
+  createdAt  DateTime @default(now())
+
+  proposal Proposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  voter    User     @relation(fields: [voterId], references: [id])
+
+  @@unique([proposalId, voterId])
+}
